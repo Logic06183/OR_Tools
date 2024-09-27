@@ -1,186 +1,145 @@
-# Import necessary libraries
+import random
+import numpy as np
+from deap import base, creator, tools, algorithms
 import gradio as gr
-from ortools.constraint_solver import routing_enums_pb2
-from ortools.constraint_solver import pywrapcp
 
-# List of city names
-city_names = ['Durban', 'Johannesburg', 'Pretoria', 'Cape Town', 'Bloemfontein']
+# Distance matrix between inland locations and Durban
+city_names = ['Johannesburg', 'Pretoria', 'Bloemfontein', 'Nelspruit', 'Polokwane']
+distances_to_durban = [
+    [0, 121, 395, 317, 320],  # Johannesburg
+    [121, 0, 512, 438, 340],  # Pretoria
+    [395, 512, 0, 460, 300],  # Bloemfontein
+    [317, 438, 460, 0, 350],  # Nelspruit
+    [320, 340, 300, 350, 0],  # Polokwane
+]
 
-def print_solution(data, manager, routing, solution):
-    """Formats the solution into a string."""
-    output = ''
+# Setting up the genetic algorithm problem
+creator.create("FitnessMin", base.Fitness, weights=(-1.0,))  # We want to minimize the distance
+creator.create("Individual", list, fitness=creator.FitnessMin)
+
+toolbox = base.Toolbox()
+toolbox.register("indices", random.sample, range(len(city_names)), len(city_names))
+toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.indices)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+# Evaluation function for the genetic algorithm considering vehicle capacity constraints
+def evaluate(individual, cargo, vehicle_capacities):
     total_distance = 0
-    total_load = 0
-    total_fuel = 0
+    vehicle_loads = [0] * len(vehicle_capacities)  # Keeps track of cargo loads per vehicle
+    vehicle_distances = [0] * len(vehicle_capacities)  # Keeps track of distances traveled
+    current_vehicle = 0  # Start with the first vehicle
 
-    capacity_dimension = routing.GetDimensionOrDie('Capacity')
-
-    for vehicle_id in range(data['num_vehicles']):
-        index = routing.Start(vehicle_id)
-        plan_output = f'Route for vehicle {vehicle_id}:\n'
-        route_distance = 0
-        route_load = data['vehicle_capacities'][vehicle_id]
-        route_fuel = 0
-        previous_index = index
-
-        while not routing.IsEnd(index):
-            node_index = manager.IndexToNode(index)
-            load = solution.Value(capacity_dimension.CumulVar(index))
-            plan_output += f' {city_names[node_index]} (Load: {load}) ->'
-            if previous_index != index:
-                # Add distance
-                distance = data['distance_matrix'][manager.IndexToNode(previous_index)][node_index]
-                route_distance += distance
-                # Calculate fuel consumption
-                fuel = distance * (1 + data['load_factor'] * route_load)
-                route_fuel += fuel
-                route_load = load
-            previous_index = index
-            index = solution.Value(routing.NextVar(index))
-
-        # Return to depot
-        node_index = manager.IndexToNode(index)
-        plan_output += f' {city_names[node_index]} (Load: {load})\n'
-        if previous_index != index:
-            distance = data['distance_matrix'][manager.IndexToNode(previous_index)][node_index]
-            route_distance += distance
-            # Calculate fuel consumption
-            fuel = distance * (1 + data['load_factor'] * route_load)
-            route_fuel += fuel
-        plan_output += f'Distance of the route: {route_distance} km\n'
-        plan_output += f'Final Load of the route: {load}\n'
-        plan_output += f'Fuel consumption of the route: {route_fuel:.2f} units\n\n'
-
-        output += plan_output
-        total_distance += route_distance
-        total_load += data['vehicle_capacities'][vehicle_id] - load  # Total delivered
-        total_fuel += route_fuel
-
-    output += f'Total distance of all routes: {total_distance} km\n'
-    output += f'Total goods delivered: {total_load} units\n'
-    output += f'Total fuel consumption: {total_fuel:.2f} units\n'
-    return output
-
-def solve_vrp(demands, vehicle_capacities, num_vehicles, load_factor):
-    """Solves the VRP with multiple vehicles and fuel efficiency optimization."""
-    try:
-        # Convert inputs to appropriate types
-        demands = [int(d) for d in demands]
-        vehicle_capacities = [int(c) for c in vehicle_capacities]
-        num_vehicles = int(num_vehicles)
-        load_factor = float(load_factor.replace(',', '.'))  # Handle comma as decimal separator
-
-        # Prepare data
-        data = {}
-        data['distance_matrix'] = [
-            [0, 568, 634, 569, 392],  # Durban
-            [568, 0, 121, 595, 100],  # Johannesburg
-            [634, 121, 0, 712, 216],  # Pretoria
-            [569, 595, 712, 0, 497],  # Cape Town
-            [392, 100, 216, 497, 0],  # Bloemfontein
-        ]
-        # Convert demands to negative values for deliveries
-        data['demands'] = [0] + [-d for d in demands[1:]]
-        data['vehicle_capacities'] = vehicle_capacities
-        data['num_vehicles'] = num_vehicles
-        data['depot'] = 0  # Starting at Durban
-        data['load_factor'] = load_factor  # For fuel efficiency calculation
-
-        # Create the routing index manager.
-        manager = pywrapcp.RoutingIndexManager(len(data['distance_matrix']),
-                                               data['num_vehicles'], data['depot'])
-
-        # Create Routing Model.
-        routing = pywrapcp.RoutingModel(manager)
-
-        # Create and register a transit callback.
-        def distance_callback(from_index, to_index):
-            """Returns the distance between the two nodes."""
-            from_node = manager.IndexToNode(from_index)
-            to_node = manager.IndexToNode(to_index)
-            distance = data['distance_matrix'][from_node][to_node]
-            return distance
-
-        transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-
-        # Define cost of each arc (distance).
-        routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-
-        # Add Capacity constraint.
-        def demand_callback(from_index):
-            """Returns the demand at each node."""
-            from_node = manager.IndexToNode(from_index)
-            return data['demands'][from_node]
-
-        demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-        routing.AddDimensionWithVehicleCapacity(
-            demand_callback_index,
-            0,  # No slack
-            data['vehicle_capacities'],  # Vehicle capacities
-            False,  # Start cumul to max capacity (for deliveries)
-            'Capacity')
-
-        capacity_dimension = routing.GetDimensionOrDie('Capacity')
-
-        # Set the starting load of vehicles to their capacities
-        for vehicle_id in range(data['num_vehicles']):
-            index = routing.Start(vehicle_id)
-            capacity_dimension.CumulVar(index).SetValue(data['vehicle_capacities'][vehicle_id])
-
-        # Set up search parameters.
-        search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-        search_parameters.first_solution_strategy = (
-            routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
-        search_parameters.local_search_metaheuristic = (
-            routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
-        search_parameters.time_limit.seconds = 10  # Adjust as needed
-
-        # Solve the problem.
-        solution = routing.SolveWithParameters(search_parameters)
-
-        # Process and return solution.
-        if solution:
-            return print_solution(data, manager, routing, solution)
+    # Calculate the route and cargo distribution for each vehicle
+    for idx in individual:
+        cargo_at_location = cargo[idx]
+        
+        # Check if current vehicle can handle more cargo; if not, switch to next vehicle
+        if vehicle_loads[current_vehicle] + cargo_at_location <= vehicle_capacities[current_vehicle]:
+            vehicle_loads[current_vehicle] += cargo_at_location
+            # Calculate distance for the current trip
+            if vehicle_distances[current_vehicle] == 0:
+                vehicle_distances[current_vehicle] += distances_to_durban[0][idx]  # Initial pickup from Durban
+            else:
+                vehicle_distances[current_vehicle] += distances_to_durban[0][idx]
         else:
-            return 'No solution found. Please check the inputs and constraints.'
-    except Exception as e:
-        return f'An error occurred: {e}'
+            # Switch to the next vehicle if available
+            current_vehicle += 1
+            if current_vehicle >= len(vehicle_capacities):
+                break  # No more vehicles available, stop the evaluation
+            # Start the route for the next vehicle
+            vehicle_loads[current_vehicle] += cargo_at_location
+            vehicle_distances[current_vehicle] += distances_to_durban[0][idx]
+    
+    # Sum up the distances traveled by all vehicles
+    total_distance = sum(vehicle_distances)
+    
+    # Apply a heavy penalty if any vehicle exceeded its capacity to prevent invalid solutions
+    penalty = 10000 * sum(1 for load, capacity in zip(vehicle_loads, vehicle_capacities) if load > capacity)
+    
+    return total_distance + penalty,
 
-# Gradio app
+toolbox.register("mate", tools.cxOrdered)
+toolbox.register("mutate", tools.mutShuffleIndexes, indpb=0.05)
+toolbox.register("select", tools.selTournament, tournsize=3)
+toolbox.register("evaluate", evaluate)
+
+# Genetic Algorithm parameters
+population_size = 50
+num_generations = 40
+crossover_probability = 0.7
+mutation_probability = 0.2
+
+def optimize_routes(cargo, priorities, vehicle_capacities):
+    # Parse vehicle capacities
+    vehicle_capacities = [int(c.strip()) for c in vehicle_capacities.split(',') if c.strip()]
+    
+    # Create an initial population
+    population = toolbox.population(n=population_size)
+
+    # Run the genetic algorithm
+    for generation in range(num_generations):
+        offspring = algorithms.varAnd(population, toolbox, cxpb=crossover_probability, mutpb=mutation_probability)
+        fits = list(map(lambda ind: toolbox.evaluate(ind, cargo, vehicle_capacities), offspring))
+        for fit, ind in zip(fits, offspring):
+            ind.fitness.values = fit
+
+        population = toolbox.select(offspring, k=len(population))
+
+    # Get the best solution found
+    best_individual = tools.selBest(population, 1)[0]
+
+    # Display the results
+    result = ""
+    current_vehicle = 0
+    vehicle_load = 0
+    total_distance = 0
+
+    for idx in best_individual:
+        cargo_picked = cargo[idx]
+        if vehicle_load + cargo_picked <= vehicle_capacities[current_vehicle]:
+            vehicle_load += cargo_picked
+            result += f"Vehicle {current_vehicle + 1} picks up cargo from {city_names[idx]} with priority {priorities[idx]} and collects {cargo_picked} units.\n"
+        else:
+            current_vehicle += 1
+            if current_vehicle >= len(vehicle_capacities):
+                break
+            vehicle_load = cargo_picked
+            result += f"\nVehicle {current_vehicle + 1} picks up cargo from {city_names[idx]} with priority {priorities[idx]} and collects {cargo_picked} units.\n"
+        total_distance += distances_to_durban[0][idx]
+
+    result += f"\nTotal distance traveled: {total_distance} km"
+    return result
+
+def gradio_interface(cargo_jhb, cargo_pta, cargo_blm, cargo_nlp, cargo_plw,
+                     priority_jhb, priority_pta, priority_blm, priority_nlp, priority_plw, vehicle_capacities):
+    cargo = [cargo_jhb, cargo_pta, cargo_blm, cargo_nlp, cargo_plw]
+    priorities = [priority_jhb, priority_pta, priority_blm, priority_nlp, priority_plw]
+    return optimize_routes(cargo, priorities, vehicle_capacities)
+
 with gr.Blocks() as demo:
-    gr.Markdown("# Fleet Routing Optimization with Fuel Efficiency")
-    gr.Markdown("Enter the demands at each city, vehicle capacities, number of vehicles, and load factor for fuel efficiency calculation.")
-
+    gr.Markdown("# Inland Cargo Pickup Optimization for Durban Port using Genetic Algorithm with Vehicle Constraints")
+    
     with gr.Row():
         with gr.Column():
-            demand_durban = gr.Number(value=0, label='Demand at Durban (Depot)')
-            demand_johannesburg = gr.Number(value=1, label='Demand at Johannesburg')
-            demand_pretoria = gr.Number(value=3, label='Demand at Pretoria')
-            demand_cape_town = gr.Number(value=2, label='Demand at Cape Town')
-            demand_bloemfontein = gr.Number(value=4, label='Demand at Bloemfontein')
-            demands = [demand_durban, demand_johannesburg, demand_pretoria, demand_cape_town, demand_bloemfontein]
+            cargo_jhb = gr.Number(label="Cargo at Johannesburg", value=2)
+            cargo_pta = gr.Number(label="Cargo at Pretoria", value=1)
+            cargo_blm = gr.Number(label="Cargo at Bloemfontein", value=3)
+            cargo_nlp = gr.Number(label="Cargo at Nelspruit", value=2)
+            cargo_plw = gr.Number(label="Cargo at Polokwane", value=2)
+        
         with gr.Column():
-            vehicle_capacities_input = gr.Textbox(value='5,5', label='Vehicle Capacities (comma-separated)')
-            num_vehicles = gr.Number(value=2, label='Number of Vehicles')
-            load_factor = gr.Textbox(value='0.01', label='Load Factor for Fuel Efficiency')
-
-    output = gr.Textbox(label='Solution')
-
-    btn = gr.Button("Optimize Routing")
-
-    def on_click(*args):
-        demands = args[:5]
-        vehicle_capacities_str = args[5]
-        num_vehicles = args[6]
-        load_factor = args[7]
-
-        # Parse vehicle capacities
-        vehicle_capacities = [int(c.strip()) for c in vehicle_capacities_str.split(',') if c.strip()]
-        return solve_vrp(demands, vehicle_capacities, num_vehicles, load_factor)
-
-    btn.click(on_click, inputs=[demand_durban, demand_johannesburg, demand_pretoria,
-                                demand_cape_town, demand_bloemfontein,
-                                vehicle_capacities_input, num_vehicles, load_factor],
-              outputs=output)
+            priority_jhb = gr.Number(label="Priority of Johannesburg", value=2)
+            priority_pta = gr.Number(label="Priority of Pretoria", value=1)
+            priority_blm = gr.Number(label="Priority of Bloemfontein", value=3)
+            priority_nlp = gr.Number(label="Priority of Nelspruit", value=2)
+            priority_plw = gr.Number(label="Priority of Polokwane", value=1)
+            vehicle_capacities = gr.Textbox(label="Vehicle Capacities (comma-separated)", value="5,5,5")
+    
+    output = gr.Textbox(label="Optimized Route")
+    run_button = gr.Button("Optimize Route")
+    
+    run_button.click(gradio_interface, inputs=[cargo_jhb, cargo_pta, cargo_blm, cargo_nlp, cargo_plw,
+                                               priority_jhb, priority_pta, priority_blm, priority_nlp, priority_plw,
+                                               vehicle_capacities], outputs=output)
 
 demo.launch()
